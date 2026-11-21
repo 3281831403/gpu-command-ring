@@ -26,6 +26,7 @@ explicit non-negative integer supplied by the caller; no clock or random source
 is involved, and fence waits tolerate one tick.
 """
 
+import copy
 from collections.abc import Mapping, Sequence
 
 
@@ -36,6 +37,127 @@ class RingError(Exception):
     this exception for contract violations. A transaction that raises must
     leave the ring in its pre-call state.
     """
+
+
+def _is_int(value) -> bool:
+    """Return whether *value* is an integer, excluding ``bool``."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_non_negative(value, name: str) -> int:
+    if not _is_int(value) or value < 0:
+        raise RingError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _check_alignment(alignment) -> int:
+    """Return *alignment* if it is a positive power of two."""
+    if not _is_int(alignment) or alignment <= 0:
+        raise RingError("alignment must be a positive power of two")
+    if alignment & (alignment - 1):
+        raise RingError("alignment must be a positive power of two")
+    return alignment
+
+
+def _block_size(bytes_: int, alignment: int) -> int:
+    """Round *bytes_* up to the next multiple of *alignment*."""
+    return (bytes_ + alignment - 1) // alignment * alignment
+
+
+def _check_capacity(capacity) -> int:
+    if not _is_int(capacity) or capacity <= 0:
+        raise RingError("capacity must be a positive integer")
+    return capacity
+
+
+def _validate_frames(frames) -> dict:
+    """Validate the ``frames`` table and return it unchanged."""
+    if not isinstance(frames, Mapping):
+        raise RingError("frames must be a mapping")
+    for number, record in frames.items():
+        if not _is_int(number) or number < 0:
+            raise RingError("frame numbers must be non-negative integers")
+        if not isinstance(record, Mapping):
+            raise RingError("frame records must be mappings")
+        blocks = record.get("blocks")
+        if not isinstance(blocks, Sequence) or isinstance(blocks, (str, bytes)):
+            raise RingError("frame blocks must be a sequence")
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                raise RingError("blocks must be mappings")
+            _check_non_negative(block.get("offset"), "block offset")
+            _check_non_negative(block.get("size"), "block size")
+        if not isinstance(record.get("committed"), bool):
+            raise RingError("frame committed flag must be a bool")
+    return frames
+
+
+def _validate_state(ring: Mapping) -> tuple[int, int, int, dict]:
+    """Validate capacity/cursor/used and the frames table."""
+    if not isinstance(ring, Mapping):
+        raise RingError("ring must be a mapping")
+    for key in ("capacity", "alignment", "cursor", "used", "frames"):
+        if key not in ring:
+            raise RingError(f"ring is missing '{key}'")
+    capacity = _check_capacity(ring["capacity"])
+    alignment = _check_alignment(ring["alignment"])
+    cursor = _check_non_negative(ring["cursor"], "cursor")
+    used = _check_non_negative(ring["used"], "used")
+    if cursor > capacity:
+        raise RingError("cursor is out of range")
+    if used > capacity:
+        raise RingError("used is out of range")
+    return capacity, alignment, cursor, _validate_frames(ring["frames"])
+
+
+def _validate_fences(ring: Mapping) -> dict:
+    """Validate the ``fences`` table and return it unchanged."""
+    if not isinstance(ring, Mapping) or "fences" not in ring:
+        raise RingError("ring is missing 'fences'")
+    fences = ring["fences"]
+    if not isinstance(fences, Mapping):
+        raise RingError("fences must be a mapping")
+    for frame, tick in fences.items():
+        if not _is_int(frame) or frame < 0:
+            raise RingError("fence frames must be non-negative integers")
+        if not _is_int(tick) or tick < 0:
+            raise RingError("fence ticks must be non-negative integers")
+    return fences
+
+
+def _check_command(command: Mapping) -> tuple[int, int]:
+    """Validate one command mapping and return ``(bytes, frame)``."""
+    if not isinstance(command, Mapping):
+        raise RingError("commands must be mappings")
+    if "bytes" not in command or "frame" not in command:
+        raise RingError("commands need 'bytes' and 'frame'")
+    bytes_ = _check_non_negative(command["bytes"], "command bytes")
+    frame = _check_non_negative(command["frame"], "command frame")
+    return bytes_, frame
+
+
+def _reserve(
+    capacity: int, cursor: int, used: int, block: int
+) -> tuple[int, int, bool]:
+    """Place *block* without splitting it; return ``(offset, cursor, wrapped)``.
+
+    A block that would cross the tail consumes ``capacity - cursor`` bytes of
+    padding and moves whole to offset 0. Free space must cover both the block
+    and that padding, otherwise :class:`RingError` is raised.
+    """
+    tail = capacity - cursor
+    if block <= tail:
+        needed = block
+        placement = (cursor, cursor + block, False)
+    else:
+        # The block crosses the tail: pad to the end and move it whole to 0.
+        if block > capacity:
+            raise RingError("block does not fit in the ring")
+        needed = tail + block
+        placement = (0, block, True)
+    if needed > capacity - used:
+        raise RingError("ring has no free space for the reservation")
+    return placement
 
 
 def alloc_block(ring: dict, bytes_: int, alignment: int) -> dict:
@@ -63,7 +185,24 @@ def alloc_block(ring: dict, bytes_: int, alignment: int) -> dict:
     padding; if the ring cannot hold it, raise :class:`RingError` before
     mutating state. The result has exactly the keys ``offset`` and ``wrapped``.
     """
-    raise NotImplementedError
+    capacity, _, cursor, _ = _validate_state(ring)
+    bytes_ = _check_non_negative(bytes_, "bytes")
+    alignment = _check_alignment(alignment)
+
+    if bytes_ == 0:
+        return {"offset": cursor, "wrapped": False}
+
+    block = _block_size(bytes_, alignment)
+    if block > capacity:
+        raise RingError("block does not fit in the ring")
+
+    offset, new_cursor, wrapped = _reserve(
+        capacity, cursor, ring["used"], block
+    )
+
+    ring["cursor"] = new_cursor
+    ring["used"] += block
+    return {"offset": offset, "wrapped": wrapped}
 
 
 def wrap_check(offset: int, size: int, capacity: int) -> bool:
@@ -80,7 +219,10 @@ def wrap_check(offset: int, size: int, capacity: int) -> bool:
     :class:`RingError`. This function is a pure predicate; it never mutates any
     ring and never adds padding itself.
     """
-    raise NotImplementedError
+    offset = _check_non_negative(offset, "offset")
+    size = _check_non_negative(size, "size")
+    capacity = _check_capacity(capacity)
+    return offset + size > capacity
 
 
 def reclaim(ring: dict, frame: int) -> dict:
@@ -106,7 +248,25 @@ def reclaim(ring: dict, frame: int) -> dict:
             "freed_bytes": int,
         }
     """
-    raise NotImplementedError
+    capacity, _, _, frames = _validate_state(ring)
+    frame = _check_non_negative(frame, "frame")
+
+    reclaimed = []
+    freed = 0
+    for number in sorted(frames):
+        record = frames[number]
+        if number <= frame and record["committed"]:
+            reclaimed.append(number)
+            freed += sum(block["size"] for block in record["blocks"])
+    if freed > ring["used"]:
+        raise RingError("frame block sizes exceed the used byte count")
+
+    for number in reclaimed:
+        del ring["frames"][number]
+    ring["used"] -= freed
+
+    kept = sorted(ring["frames"])
+    return {"reclaimed": reclaimed, "kept": kept, "freed_bytes": freed}
 
 
 def plan_frame(commands: Sequence[Mapping], budget: int) -> list[list]:
@@ -127,7 +287,30 @@ def plan_frame(commands: Sequence[Mapping], budget: int) -> list[list]:
     command sequence returns ``[]``. Invalid commands or budgets raise
     :class:`RingError` without mutating the input.
     """
-    raise NotImplementedError
+    if not _is_int(budget) or budget <= 0:
+        raise RingError("budget must be a positive integer")
+    if isinstance(commands, (str, bytes)) or not isinstance(
+        commands, Sequence
+    ):
+        raise RingError("commands must be a sequence")
+
+    checked = [_check_command(command) for command in commands]
+
+    plan: list[list] = []
+    current: list = []
+    current_bytes = 0
+    for command, (bytes_, _) in zip(commands, checked):
+        if bytes_ > budget:
+            raise RingError("command exceeds the frame budget")
+        if current and current_bytes + bytes_ > budget:
+            plan.append(current)
+            current = []
+            current_bytes = 0
+        current.append(command)
+        current_bytes += bytes_
+    if current:
+        plan.append(current)
+    return plan
 
 
 def fence_tick(ring: dict, frame: int, tick: int) -> dict:
@@ -143,7 +326,14 @@ def fence_tick(ring: dict, frame: int, tick: int) -> dict:
     On success store the tick in ``ring["fences"][frame]`` and return exactly
     ``{"frame": frame, "tick": tick}``.
     """
-    raise NotImplementedError
+    fences = _validate_fences(ring)
+    frame = _check_non_negative(frame, "frame")
+    tick = _check_non_negative(tick, "tick")
+
+    if frame in fences and tick < fences[frame]:
+        raise RingError("fence tick must not move backwards")
+    fences[frame] = tick
+    return {"frame": frame, "tick": tick}
 
 
 def wait_fence(ring: dict, frame: int, tick: int) -> bool:
@@ -160,7 +350,13 @@ def wait_fence(ring: dict, frame: int, tick: int) -> bool:
     :class:`RingError`. Waiting for a later tick is the caller's job -- this
     function never busy-waits and never advances any tick.
     """
-    raise NotImplementedError
+    fences = _validate_fences(ring)
+    frame = _check_non_negative(frame, "frame")
+    tick = _check_non_negative(tick, "tick")
+
+    if frame not in fences:
+        return False
+    return tick + 1 >= fences[frame]
 
 
 def validate(ring: dict, commands: Sequence[Mapping]) -> list[str]:
@@ -183,7 +379,81 @@ def validate(ring: dict, commands: Sequence[Mapping]) -> list[str]:
     Each issue is a short string and the result preserves discovery order:
     first ring-level problems, then command problems in input order.
     """
-    raise NotImplementedError
+    issues: list[str] = []
+    problems: list[str] = []
+
+    capacity = None
+    if not isinstance(ring, Mapping):
+        problems.append("ring must be a mapping")
+    else:
+        raw_capacity = ring.get("capacity")
+        if not _is_int(raw_capacity) or raw_capacity <= 0:
+            problems.append("capacity must be a positive integer")
+        else:
+            capacity = raw_capacity
+
+        alignment = ring.get("alignment")
+        if (
+            not _is_int(alignment)
+            or alignment <= 0
+            or alignment & (alignment - 1)
+        ):
+            problems.append("alignment must be a positive power of two")
+
+        if capacity is not None:
+            cursor = ring.get("cursor", 0)
+            if not _is_int(cursor) or cursor < 0 or cursor > capacity:
+                problems.append("cursor is out of range")
+            used = ring.get("used", 0)
+            if not _is_int(used) or used < 0 or used > capacity:
+                problems.append("used is out of range")
+
+    issues.extend(problems)
+
+    if (
+        not isinstance(commands, Sequence)
+        or isinstance(commands, (str, bytes))
+    ):
+        issues.append("commands must be a sequence")
+        return issues
+
+    first_run: dict[int, int] = {}
+    run = -1
+    previous = object()
+    for index, command in enumerate(commands):
+        label = f"command {index}"
+        if not isinstance(command, Mapping):
+            issues.append(f"{label}: must be a mapping")
+            continue
+        bytes_ = command.get("bytes")
+        frame = command.get("frame")
+        bytes_ok = _is_int(bytes_) and bytes_ >= 0
+        if not bytes_ok:
+            issues.append(f"{label}: bytes must be a non-negative integer")
+        frame_ok = _is_int(frame) and frame >= 0
+        if not frame_ok:
+            issues.append(f"{label}: frame must be a non-negative integer")
+
+        if bytes_ok and capacity is not None:
+            alignment = ring.get("alignment")
+            if (
+                _is_int(alignment)
+                and alignment > 0
+                and not alignment & (alignment - 1)
+                and _block_size(bytes_, alignment) > capacity
+            ):
+                issues.append(f"{label}: block size exceeds capacity")
+
+        if frame_ok:
+            if frame != previous:
+                run += 1
+                previous = frame
+            if frame in first_run and first_run[frame] != run:
+                issues.append(f"{label}: frame {frame} is reopened")
+            else:
+                first_run.setdefault(frame, run)
+
+    return issues
 
 
 def ring_batch(frames: Sequence[Mapping], config: Mapping) -> dict:
@@ -233,7 +503,140 @@ def ring_batch(frames: Sequence[Mapping], config: Mapping) -> dict:
     An empty batch returns empty ``frames`` and ``committed`` lists without
     changing the ring.
     """
-    raise NotImplementedError
+    if not isinstance(config, Mapping):
+        raise RingError("config must be a mapping")
+    ring = config.get("ring")
+    if not isinstance(ring, dict):
+        raise RingError("config['ring'] must be a dict")
+    capacity, _, cursor, _ = _validate_state(ring)
+    fences = _validate_fences(ring)
+    alignment = _check_alignment(config.get("alignment"))
+    budget = config.get("budget")
+    if not _is_int(budget) or budget <= 0:
+        raise RingError("budget must be a positive integer")
+
+    if not isinstance(frames, Sequence) or isinstance(frames, (str, bytes)):
+        raise RingError("frames must be a sequence")
+
+    ticks = config.get("ticks")
+    if ticks is None:
+        ticks = {}
+    elif not isinstance(ticks, Mapping):
+        raise RingError("ticks must be a mapping")
+    for tick_frame, tick in ticks.items():
+        _check_non_negative(tick_frame, "tick frame")
+        _check_non_negative(tick, "tick")
+
+    # Validate and plan the whole batch before touching the ring, so a bad
+    # frame cannot leave earlier frames half-recorded. The cursor and used
+    # counts accumulate across frames while each frame gets its own block list.
+    seen_frames: set[int] = set()
+    planned: list[dict] = []
+    next_cursor = cursor
+    next_used = ring["used"]
+    for entry in frames:
+        if not isinstance(entry, Mapping):
+            raise RingError("frames must be mappings")
+        if "frame" not in entry or "commands" not in entry:
+            raise RingError("frames need 'frame' and 'commands'")
+        frame = _check_non_negative(entry["frame"], "frame")
+        if frame in seen_frames:
+            raise RingError("duplicate frame in batch")
+        if frame in ring["frames"]:
+            raise RingError("frame is already recorded in the ring")
+        seen_frames.add(frame)
+
+        commands = entry["commands"]
+        if not isinstance(commands, Sequence) or isinstance(
+            commands, (str, bytes)
+        ):
+            raise RingError("frame commands must be a sequence")
+
+        total = 0
+        checked = []
+        for command in commands:
+            bytes_, command_frame = _check_command(command)
+            if command_frame != frame:
+                raise RingError("command frame does not match its frame")
+            total += bytes_
+            checked.append((command, bytes_))
+        if total > budget:
+            raise RingError("frame exceeds its byte budget")
+
+        blocks = []
+        frame_cursor = next_cursor
+        frame_used = next_used
+        for _, bytes_ in checked:
+            block = _block_size(bytes_, alignment)
+            if block > capacity:
+                raise RingError("block does not fit in the ring")
+            offset, frame_cursor, wrapped = _reserve(
+                capacity, frame_cursor, frame_used, block
+            )
+            frame_used += block
+            blocks.append(
+                {"offset": offset, "size": block, "wrapped": wrapped}
+            )
+        next_cursor = frame_cursor
+        next_used = frame_used
+
+        tick = ticks.get(frame) if frame in ticks else None
+        planned.append(
+            {
+                "frame": frame,
+                "bytes": total,
+                "blocks": blocks,
+                "tick": tick,
+                "cursor": frame_cursor,
+                "used": frame_used,
+            }
+        )
+
+    # Fence ticks are monotonic per frame; check against both the existing
+    # ring fences and ticks recorded earlier in this same batch.
+    pending_ticks: dict[int, int] = {}
+    for item in planned:
+        tick = item["tick"]
+        if tick is None:
+            continue
+        frame = item["frame"]
+        if frame in fences and tick < fences[frame]:
+            raise RingError("fence tick must not move backwards")
+        if frame in pending_ticks and tick < pending_ticks[frame]:
+            raise RingError("fence tick must not move backwards")
+        pending_ticks[frame] = tick
+
+    snapshot = copy.deepcopy(ring)
+    try:
+        for item in planned:
+            frame = item["frame"]
+            ring["frames"][frame] = {
+                "blocks": item["blocks"],
+                "committed": True,
+            }
+            if item["tick"] is not None:
+                ring["fences"][frame] = item["tick"]
+            ring["cursor"] = item["cursor"]
+            ring["used"] = item["used"]
+    except Exception:
+        restored = copy.deepcopy(snapshot)
+        ring.clear()
+        ring.update(restored)
+        raise
+
+    return {
+        "frames": [
+            {
+                "frame": item["frame"],
+                "bytes": item["bytes"],
+                "blocks": item["blocks"],
+                "tick": item["tick"],
+            }
+            for item in planned
+        ],
+        "committed": [item["frame"] for item in planned],
+        "ring": ring,
+    }
 
 
 __all__ = [
